@@ -1,0 +1,97 @@
+#!/bin/sh
+
+set -eu
+
+print_banner() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    c_reset=$(printf '\033[0m')
+    c_bold=$(printf '\033[1m')
+    c_green=$(printf '\033[32m')
+    c_yellow=$(printf '\033[33m')
+  else
+    c_reset=
+    c_bold=
+    c_green=
+    c_yellow=
+  fi
+
+  # Source art: https://ascii.co.uk/art/trash, signed Juergen Jakubowski.
+  printf '\n'
+  printf '%s\n' "     ${c_yellow}______mXXXXXXm______${c_reset}"
+  printf '%s\n' "    ${c_yellow}*m==================m*${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  _=  _=  _=  _=  T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  T   T   T   T   T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  T   T   T   T   T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  T   T   T   T   T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  T   T   T   T   T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  T   T   T   T   T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}T  ~=  ~=  ~=  ~=  T${c_reset}"
+  printf '%s\n' "     ${c_green}${c_bold}~==================~${c_reset}"
+  printf '\n'
+}
+
+confirm_cleanup() {
+  answer=
+
+  printf '%s' "Run cache cleanup now? [y/N] "
+  read -r answer || answer=
+
+  case "$answer" in
+    y | Y) return 0 ;;
+    *)
+      printf '%s\n' "Cancelled."
+      exit 0
+      ;;
+  esac
+}
+
+clean_dir_contents() {
+  dir=$1
+  label=$2
+
+  if [ ! -d "$dir" ]; then
+    printf '%s\n' "Skipping $label: $dir does not exist."
+    return
+  fi
+
+  printf '%s\n' "Cleaning $label..."
+  find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+}
+
+clean_path() {
+  path=$1
+  label=$2
+
+  if [ ! -e "$path" ]; then
+    printf '%s\n' "Skipping $label: $path does not exist."
+    return
+  fi
+
+  printf '%s\n' "Cleaning $label..."
+  rm -rf "$path"
+}
+
+clean_command() {
+  command_name=$1
+  label=$2
+  shift 2
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf '%s\n' "Skipping $label: $command_name is not installed."
+    return
+  fi
+
+  printf '%s\n' "Cleaning $label..."
+  "$@"
+}
+
+print_banner
+confirm_cleanup
+
+clean_dir_contents "$HOME/Library/Developer/Xcode/DerivedData" "Xcode DerivedData"
+clean_dir_contents "$HOME/Library/Developer/Xcode/Archives" "Xcode Archives"
+clean_command pod "CocoaPods cache" pod cache clean --all
+clean_command npm "npm cache" npm cache clean --force
+clean_path "$HOME/.npm/_npx" "npx cache"
+
+printf '%s\n' "Done."
