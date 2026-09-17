@@ -2,6 +2,51 @@
 
 set -eu
 
+dry_run=0
+warning_count=0
+
+usage() {
+  printf '%s\n' "Usage: ${0##*/} [--dry-run]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n | --dry-run) dry_run=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+ss_home_check=${HOME:-}
+ss_home_check=${ss_home_check%/}
+case "$ss_home_check" in
+  '' | / | . | .. | */../* | */.. | */./* | */.)
+    printf '%s\n' 'Refusing to run without a safe HOME directory.' >&2
+    exit 2
+    ;;
+  /*)
+    case "$ss_home_check" in
+      *[!/]*) ;;
+      *)
+        printf '%s\n' 'Refusing a root-equivalent HOME directory.' >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    printf 'Refusing non-absolute HOME directory: %s\n' "$HOME" >&2
+    exit 2
+    ;;
+esac
+
 print_banner() {
   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     c_reset=$(printf '\033[0m')
@@ -30,68 +75,655 @@ print_banner() {
   printf '\n'
 }
 
-confirm_cleanup() {
-  answer=
+prompt_yes() {
+  ss_prompt=$1
+  ss_answer=
 
-  printf '%s' "Run cache cleanup now? [y/N] "
-  read -r answer || answer=
+  printf '%s' "$ss_prompt"
+  if IFS= read -r ss_answer; then
+    :
+  else
+    ss_answer=
+  fi
 
-  case "$answer" in
+  case "$ss_answer" in
     y | Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+record_warning() {
+  warning_count=$((warning_count + 1))
+  printf 'Warning: %s\n' "$1" >&2
+}
+
+print_command() {
+  printf 'Would run:'
+  for ss_arg in "$@"; do
+    printf ' [%s]' "$ss_arg"
+  done
+  printf '\n'
+}
+
+run_nonfatal() {
+  ss_run_label=$1
+  shift
+
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'Dry run for %s. ' "$ss_run_label"
+    print_command "$@"
+    return 0
+  fi
+
+  printf 'Cleaning %s...\n' "$ss_run_label"
+  if "$@"; then
+    return 0
+  else
+    ss_run_status=$?
+    record_warning "$ss_run_label failed with status $ss_run_status; continuing."
+    return 0
+  fi
+}
+
+validate_child_path() {
+  ss_child=${1%/}
+  ss_parent=${2%/}
+
+  case "$ss_child" in
+    '' | / | . | ..)
+      record_warning "refusing unsafe cleanup target: $1"
+      return 1
+      ;;
+    /*) ;;
     *)
-      printf '%s\n' "Cancelled."
-      exit 0
+      record_warning "refusing non-absolute cleanup target: $1"
+      return 1
+      ;;
+  esac
+
+  case "$ss_child" in
+    *[!/]*) ;;
+    *)
+      record_warning "refusing root-equivalent cleanup target: $1"
+      return 1
+      ;;
+  esac
+
+  case "$ss_child" in
+    */../* | */.. | */./* | */.)
+      record_warning "refusing cleanup target with dot segments: $1"
+      return 1
+      ;;
+  esac
+
+  case "$ss_parent" in
+    '' | / | . | ..)
+      record_warning "refusing unsafe cleanup parent: $2"
+      return 1
+      ;;
+    /*) ;;
+    *)
+      record_warning "refusing non-absolute cleanup parent: $2"
+      return 1
+      ;;
+  esac
+
+  case "$ss_parent" in
+    *[!/]*) ;;
+    *)
+      record_warning "refusing root-equivalent cleanup parent: $2"
+      return 1
+      ;;
+  esac
+
+  case "$ss_parent" in
+    */../* | */.. | */./* | */.)
+      record_warning "refusing cleanup parent with dot segments: $2"
+      return 1
+      ;;
+  esac
+
+  case "$ss_child" in
+    "$ss_parent"/*) return 0 ;;
+    *)
+      record_warning "refusing target outside $ss_parent: $1"
+      return 1
       ;;
   esac
 }
 
-clean_dir_contents() {
-  dir=$1
-  label=$2
+print_path_size() {
+  ss_size_path=$1
 
-  if [ ! -d "$dir" ]; then
-    printf '%s\n' "Skipping $label: $dir does not exist."
-    return
+  if [ ! -e "$ss_size_path" ] && [ ! -L "$ss_size_path" ]; then
+    return 0
   fi
 
-  printf '%s\n' "Cleaning $label..."
-  find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  ss_size=$(du -sh "$ss_size_path" 2>/dev/null | awk 'NR == 1 { print $1 }')
+  if [ -n "$ss_size" ]; then
+    printf 'Current size: %s (%s)\n' "$ss_size" "$ss_size_path"
+  else
+    printf 'Path: %s\n' "$ss_size_path"
+  fi
+}
+
+clean_dir_contents() {
+  ss_clean_dir=${1%/}
+  ss_clean_parent=$2
+  ss_clean_label=$3
+
+  if ! validate_child_path "$ss_clean_dir" "$ss_clean_parent"; then
+    return 0
+  fi
+  if [ -L "$ss_clean_dir" ]; then
+    record_warning "refusing symlinked directory for $ss_clean_label: $ss_clean_dir"
+    return 0
+  fi
+  if [ ! -d "$ss_clean_dir" ]; then
+    printf 'Skipping %s: %s does not exist.\n' "$ss_clean_label" "$ss_clean_dir"
+    return 0
+  fi
+
+  run_nonfatal "$ss_clean_label" \
+    find "$ss_clean_dir" -mindepth 1 -maxdepth 1 -exec rm -rf '{}' +
 }
 
 clean_path() {
-  path=$1
-  label=$2
+  ss_clean_path=${1%/}
+  ss_clean_parent=$2
+  ss_clean_label=$3
 
-  if [ ! -e "$path" ]; then
-    printf '%s\n' "Skipping $label: $path does not exist."
-    return
+  if ! validate_child_path "$ss_clean_path" "$ss_clean_parent"; then
+    return 0
+  fi
+  if [ ! -e "$ss_clean_path" ] && [ ! -L "$ss_clean_path" ]; then
+    printf 'Skipping %s: %s does not exist.\n' "$ss_clean_label" "$ss_clean_path"
+    return 0
   fi
 
-  printf '%s\n' "Cleaning $label..."
-  rm -rf "$path"
+  run_nonfatal "$ss_clean_label" rm -rf "$ss_clean_path"
+}
+
+clean_files_older_than() {
+  ss_old_dir=${1%/}
+  ss_old_parent=$2
+  ss_old_label=$3
+  ss_old_days=$4
+
+  if ! validate_child_path "$ss_old_dir" "$ss_old_parent"; then
+    return 0
+  fi
+  if [ -L "$ss_old_dir" ]; then
+    record_warning "refusing symlinked directory for $ss_old_label: $ss_old_dir"
+    return 0
+  fi
+  if [ ! -d "$ss_old_dir" ]; then
+    printf 'Skipping %s: %s does not exist.\n' "$ss_old_label" "$ss_old_dir"
+    return 0
+  fi
+
+  case "$ss_old_days" in
+    '' | *[!0-9]*)
+      record_warning "invalid age for $ss_old_label: $ss_old_days"
+      return 0
+      ;;
+  esac
+
+  run_nonfatal "$ss_old_label" \
+    find "$ss_old_dir" -type f -mtime "+$ss_old_days" -delete
 }
 
 clean_command() {
-  command_name=$1
-  label=$2
+  ss_clean_program=$1
+  ss_clean_label=$2
   shift 2
 
-  if ! command -v "$command_name" >/dev/null 2>&1; then
-    printf '%s\n' "Skipping $label: $command_name is not installed."
-    return
+  if ! command -v "$ss_clean_program" >/dev/null 2>&1; then
+    printf 'Skipping %s: %s is not installed.\n' \
+      "$ss_clean_label" "$ss_clean_program"
+    return 0
   fi
 
-  printf '%s\n' "Cleaning $label..."
-  "$@"
+  run_nonfatal "$ss_clean_label" "$@"
+}
+
+optional_command() {
+  ss_optional_program=$1
+  ss_optional_label=$2
+  ss_optional_warning=$3
+  shift 3
+
+  if ! command -v "$ss_optional_program" >/dev/null 2>&1; then
+    printf 'Skipping optional %s: %s is not installed.\n' \
+      "$ss_optional_label" "$ss_optional_program"
+    return 0
+  fi
+
+  printf '\nOptional cleanup: %s\n' "$ss_optional_label"
+  printf '%s\n' "$ss_optional_warning"
+  if prompt_yes 'Run this cleanup? [y/N] '; then
+    run_nonfatal "$ss_optional_label" "$@"
+  else
+    printf 'Keeping %s.\n' "$ss_optional_label"
+  fi
+}
+
+optional_path() {
+  ss_optional_path=${1%/}
+  ss_optional_parent=$2
+  ss_optional_label=$3
+  ss_optional_warning=$4
+
+  if ! validate_child_path "$ss_optional_path" "$ss_optional_parent"; then
+    return 0
+  fi
+  if [ ! -e "$ss_optional_path" ] && [ ! -L "$ss_optional_path" ]; then
+    printf 'Skipping optional %s: %s does not exist.\n' \
+      "$ss_optional_label" "$ss_optional_path"
+    return 0
+  fi
+
+  printf '\nOptional cleanup: %s\n' "$ss_optional_label"
+  print_path_size "$ss_optional_path"
+  printf '%s\n' "$ss_optional_warning"
+  if prompt_yes 'Delete this item? [y/N] '; then
+    clean_path "$ss_optional_path" "$ss_optional_parent" "$ss_optional_label"
+  else
+    printf 'Keeping %s.\n' "$ss_optional_label"
+  fi
+}
+
+optional_files_older_than() {
+  ss_optional_old_dir=${1%/}
+  ss_optional_old_parent=$2
+  ss_optional_old_label=$3
+  ss_optional_old_warning=$4
+  ss_optional_old_days=$5
+
+  if ! validate_child_path "$ss_optional_old_dir" "$ss_optional_old_parent"; then
+    return 0
+  fi
+  if [ ! -d "$ss_optional_old_dir" ]; then
+    printf 'Skipping optional %s: %s does not exist.\n' \
+      "$ss_optional_old_label" "$ss_optional_old_dir"
+    return 0
+  fi
+
+  printf '\nOptional cleanup: %s\n' "$ss_optional_old_label"
+  printf '%s\n' "$ss_optional_old_warning"
+  if prompt_yes 'Delete these files? [y/N] '; then
+    clean_files_older_than \
+      "$ss_optional_old_dir" \
+      "$ss_optional_old_parent" \
+      "$ss_optional_old_label" \
+      "$ss_optional_old_days"
+  else
+    printf 'Keeping %s.\n' "$ss_optional_old_label"
+  fi
+}
+
+optional_simulator_device() {
+  ss_simulator_udid=$1
+  ss_simulator_label=$2
+  ss_simulator_size_path="$HOME/Library/Developer/CoreSimulator/Devices/$ss_simulator_udid"
+
+  if ! command -v xcrun >/dev/null 2>&1; then
+    printf 'Skipping optional %s: xcrun is not installed.\n' \
+      "$ss_simulator_label"
+    return 0
+  fi
+  if [ ! -d "$ss_simulator_size_path" ]; then
+    printf 'Skipping optional %s: simulator device is no longer present.\n' \
+      "$ss_simulator_label"
+    return 0
+  fi
+
+  printf '\nOptional cleanup: %s\n' "$ss_simulator_label"
+  print_path_size "$ss_simulator_size_path"
+  printf '%s\n' \
+    'This deletes the simulator and all of its installed apps, Keychain, Photos, and test data.'
+  if prompt_yes 'Delete this simulator device? [y/N] '; then
+    run_nonfatal "$ss_simulator_label" xcrun simctl delete "$ss_simulator_udid"
+  else
+    printf 'Keeping %s.\n' "$ss_simulator_label"
+  fi
+}
+
+docker_uses_local_socket() {
+  ss_docker_endpoint=
+  if [ -n "${DOCKER_CONTEXT:-}" ]; then
+    ss_docker_endpoint=$(docker context inspect \
+      --format '{{ .Endpoints.docker.Host }}' \
+      "$DOCKER_CONTEXT" 2>/dev/null || :)
+  elif [ -n "${DOCKER_HOST:-}" ]; then
+    ss_docker_endpoint=$DOCKER_HOST
+  else
+    ss_docker_endpoint=$(docker context inspect \
+      --format '{{ .Endpoints.docker.Host }}' 2>/dev/null || :)
+  fi
+
+  case "$ss_docker_endpoint" in
+    unix:///*)
+      printf 'Docker endpoint: %s\n' "$ss_docker_endpoint"
+      return 0
+      ;;
+    '')
+      printf '%s\n' \
+        'Skipping Docker cleanup: the active Docker endpoint could not be determined.'
+      return 1
+      ;;
+    *)
+      printf 'Skipping Docker cleanup: active endpoint is not a local Unix socket (%s).\n' \
+        "$ss_docker_endpoint"
+      return 1
+      ;;
+  esac
+}
+
+clean_docker_builder_cache() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '%s\n' 'Skipping Docker build cache: docker is not installed.'
+    return 0
+  fi
+  if ! docker_uses_local_socket; then
+    return 0
+  fi
+
+  if [ "$dry_run" -ne 1 ] && ! docker info >/dev/null 2>&1; then
+    printf '%s\n' 'Skipping Docker build cache: the Docker daemon is not available.'
+    return 0
+  fi
+
+  run_nonfatal 'Docker build cache older than 7 days' \
+    docker builder prune --all --force --filter 'until=168h'
+}
+
+optional_docker_system_prune() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '%s\n' 'Skipping optional Docker system cleanup: docker is not installed.'
+    return 0
+  fi
+  if ! docker_uses_local_socket; then
+    return 0
+  fi
+  if [ "$dry_run" -ne 1 ] && ! docker info >/dev/null 2>&1; then
+    printf '%s\n' \
+      'Skipping optional Docker system cleanup: the Docker daemon is not available.'
+    return 0
+  fi
+
+  optional_command \
+    docker \
+    'unused Docker containers, networks, images, and build cache' \
+    'This is broader than cache cleanup. It deletes stopped containers and unused images and networks, but not volumes.' \
+    docker system prune --all --force
+}
+
+clean_standard_caches() {
+  printf '\n%s\n' 'Cleaning routine, rebuildable caches...'
+
+  clean_dir_contents \
+    "$HOME/Library/Developer/Xcode/DerivedData" \
+    "$HOME/Library/Developer/Xcode" \
+    'Xcode DerivedData'
+
+  clean_command pod 'CocoaPods cache' pod cache clean --all
+  clean_command npm 'npm cache' npm cache clean --force
+  clean_command npm 'npx cache' npm cache npx rm
+  clean_command yarn 'Yarn cache' yarn --cwd "$HOME" cache clean
+  clean_command pnpm 'pnpm store' pnpm store prune
+  clean_command swift 'SwiftPM repository cache' swift package purge-cache
+  clean_command go 'Go module cache' go clean -modcache
+  clean_command composer 'Composer cache' composer clear-cache
+  clean_command brew 'Homebrew cache and old versions' \
+    env HOMEBREW_NO_AUTOREMOVE=1 brew cleanup --prune=all
+
+  clean_dir_contents \
+    "$HOME/.bun/install/cache" \
+    "$HOME/.bun/install" \
+    'Bun package cache'
+  clean_dir_contents \
+    "$HOME/.expo/expo-go" \
+    "$HOME/.expo" \
+    'Expo Go cache'
+  clean_dir_contents \
+    "$HOME/.expo/ios-simulator-app-cache" \
+    "$HOME/.expo" \
+    'Expo iOS Simulator app cache'
+  clean_dir_contents \
+    "$HOME/Library/Caches/node-gyp" \
+    "$HOME/Library/Caches" \
+    'node-gyp cache'
+  clean_dir_contents \
+    "$HOME/Library/Caches/ReactNative" \
+    "$HOME/Library/Caches" \
+    'React Native cache'
+  clean_dir_contents \
+    "$HOME/Library/Caches/dotslash" \
+    "$HOME/Library/Caches" \
+    'Dotslash cache'
+  clean_dir_contents \
+    "$HOME/Library/Caches/colima" \
+    "$HOME/Library/Caches" \
+    'Colima download cache'
+  clean_dir_contents \
+    "$HOME/Library/Caches/com.apple.amp.itmstransporter" \
+    "$HOME/Library/Caches" \
+    'App Store Transporter cache'
+  clean_dir_contents \
+    "$HOME/Library/Caches/com.apple.dt.Xcode" \
+    "$HOME/Library/Caches" \
+    'Xcode application cache'
+  clean_dir_contents \
+    "$HOME/Library/Logs/CoreSimulator" \
+    "$HOME/Library/Logs" \
+    'CoreSimulator logs'
+  clean_dir_contents \
+    "$HOME/Library/Containers/com.apple.CoreDevice.CoreDeviceService/Data/Library/Caches/AppInstallationBinaryDeltas" \
+    "$HOME/Library/Containers/com.apple.CoreDevice.CoreDeviceService/Data/Library/Caches" \
+    'CoreDevice app installation deltas'
+  clean_dir_contents \
+    "$HOME/Library/Application Support/Google/GoogleUpdater/crx_cache" \
+    "$HOME/Library/Application Support/Google/GoogleUpdater" \
+    'Google Updater download cache'
+  clean_dir_contents \
+    "$HOME/.npm/_logs" \
+    "$HOME/.npm" \
+    'npm logs'
+  clean_dir_contents \
+    "$HOME/.npm/_libvips" \
+    "$HOME/.npm" \
+    'npm libvips downloads'
+  clean_dir_contents \
+    "$HOME/.npm/_prebuilds" \
+    "$HOME/.npm" \
+    'npm prebuilt-binary downloads'
+
+  ss_tmp_root=${TMPDIR:-}
+  case "$ss_tmp_root" in
+    '' | /)
+      printf '%s\n' 'Skipping Metro cache: TMPDIR is not safe.'
+      ;;
+    /*)
+      ss_tmp_root=${ss_tmp_root%/}
+      clean_dir_contents \
+        "$ss_tmp_root/metro-cache" \
+        "$ss_tmp_root" \
+        'Metro cache'
+      ;;
+    *)
+      printf '%s\n' 'Skipping Metro cache: TMPDIR is not absolute.'
+      ;;
+  esac
+
+  ss_darwin_cache=$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || :)
+  if [ -z "$ss_darwin_cache" ]; then
+    case "${ss_tmp_root:-}" in
+      */T) ss_darwin_cache=${ss_tmp_root%/T}/C ;;
+    esac
+  fi
+  case "$ss_darwin_cache" in
+    '' | /)
+      printf '%s\n' 'Skipping Clang module cache: its cache root was not found.'
+      ;;
+    /*)
+      ss_darwin_cache=${ss_darwin_cache%/}
+      clean_dir_contents \
+        "$ss_darwin_cache/clang/ModuleCache" \
+        "$ss_darwin_cache" \
+        'Clang module cache'
+      ;;
+    *)
+      printf '%s\n' 'Skipping Clang module cache: its cache root is not absolute.'
+      ;;
+  esac
+
+  clean_docker_builder_cache
+}
+
+review_optional_cleanups() {
+  printf '\n%s\n' 'Reviewing optional cleanups. Every answer defaults to No.'
+
+  optional_simulator_device \
+    'A7899EC9-3939-4522-81AE-8FA2C83ECE5C' \
+    'iPhone 17 Simulator device'
+  optional_simulator_device \
+    '25D778E9-D97E-473D-9276-20AD525408B1' \
+    'iPhone 16e Simulator device'
+  optional_simulator_device \
+    'BCD93401-9244-49C9-8273-95842EE5DA5D' \
+    'iPad mini (A17 Pro) Simulator device'
+  optional_simulator_device \
+    '64488D5E-438A-488D-AD4A-1FDFDE520E64' \
+    'iPad Pro 11-inch (M5) Simulator device'
+
+  optional_command \
+    xcrun \
+    'all remaining unavailable Simulator devices' \
+    'This deletes every simulator whose runtime is missing. Say No if that includes a device above that you chose to keep.' \
+    xcrun simctl delete unavailable
+
+  optional_path \
+    "$HOME/Library/Developer/Xcode/iOS DeviceSupport/iPhone14,5 26.4.2 (23E261)" \
+    "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+    'iPhone14,5 support files for iOS 26.4.2' \
+    'Delete only if you no longer test this exact OS; Xcode must copy or download the support files again if it reconnects.'
+  optional_path \
+    "$HOME/Library/Developer/Xcode/iOS DeviceSupport/iPhone14,5 26.5 (23F77)" \
+    "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+    'iPhone14,5 support files for iOS 26.5' \
+    'Delete only if you no longer test this exact OS; Xcode must copy or download the support files again if it reconnects.'
+  optional_path \
+    "$HOME/Library/Developer/Xcode/iOS DeviceSupport/iPhone14,5 26.5.2 (23F84)" \
+    "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+    'iPhone14,5 support files for iOS 26.5.2' \
+    'Delete only if you no longer test this exact OS; Xcode must copy or download the support files again if it reconnects.'
+
+  optional_docker_system_prune
+  optional_command \
+    colima \
+    'entire Colima default profile and runtime data' \
+    'This permanently deletes the default Colima VM plus all of its containers, images, and volumes.' \
+    colima delete --data --force
+  optional_command \
+    brew \
+    'unused Homebrew dependencies' \
+    'This uninstalls formulae Homebrew considers no longer required; reinstall them if that judgment is wrong.' \
+    brew autoremove
+
+  optional_files_older_than \
+    "$HOME/Library/Logs" \
+    "$HOME/Library" \
+    'user log files older than 30 days' \
+    'This removes historical application diagnostics, which may still be useful when investigating an old problem.' \
+    30
+
+  optional_path \
+    "$HOME/.cache/codex-runtimes" \
+    "$HOME/.cache" \
+    'Codex runtime cache' \
+    'Quit Codex first. Its bundled runtime tooling will need to be restored before future tasks use it.'
+  optional_path \
+    "$HOME/Library/Application Support/redact/modules/core.asar-tmp" \
+    "$HOME/Library/Application Support/redact/modules" \
+    'stale Redact core.asar temporary data' \
+    'Delete this only while Redact is stopped; it appears to be abandoned update data.'
+
+  optional_path \
+    "$HOME/repos/grow/node_modules" \
+    "$HOME/repos/grow" \
+    'grow node_modules' \
+    'This project dependency tree must be installed again before the project can build.'
+  optional_path \
+    "$HOME/repos/grow/ios/Pods" \
+    "$HOME/repos/grow/ios" \
+    'grow iOS Pods' \
+    'The CocoaPods dependencies must be installed again before the iOS project can build.'
+  optional_path \
+    "$HOME/repos/jorm/apps/kan/node_modules" \
+    "$HOME/repos/jorm/apps/kan" \
+    'jorm kan node_modules' \
+    'This project dependency tree must be installed again before the project can build.'
+  optional_path \
+    "$HOME/repos/rspiral/apps/web/.next" \
+    "$HOME/repos/rspiral/apps/web" \
+    'rspiral web Next.js build output' \
+    'This generated web build output will be recreated by the next build.'
+  optional_path \
+    "$HOME/repos/rspiral/node_modules" \
+    "$HOME/repos/rspiral" \
+    'rspiral node_modules' \
+    'This project dependency tree must be installed again before the project can build.'
+  optional_path \
+    "$HOME/repos/grow/_reference/hangoutman/build" \
+    "$HOME/repos/grow/_reference/hangoutman" \
+    'hangoutman reference build output' \
+    'This generated reference-project output will be recreated by a future build.'
+  optional_path \
+    "$HOME/repos/leg/couple/node_modules" \
+    "$HOME/repos/leg/couple" \
+    'couple node_modules' \
+    'This project dependency tree must be installed again before the project can build.'
+  optional_path \
+    "$HOME/repos/robocollab/sonic/viewer/node_modules" \
+    "$HOME/repos/robocollab/sonic/viewer" \
+    'sonic viewer node_modules' \
+    'This project dependency tree must be installed again before the project can build.'
+  optional_path \
+    "$HOME/repos/hm1/dash/node_modules" \
+    "$HOME/repos/hm1/dash" \
+    'hm1 dash node_modules' \
+    'This project dependency tree must be installed again before the project can build.'
+  optional_path \
+    "$HOME/repos/evrsoft/node_modules 6.10.25 PM" \
+    "$HOME/repos/evrsoft" \
+    'dated evrsoft node_modules copy' \
+    'This looks like an old copied dependency tree; keep it if the unusual dated copy was intentional.'
 }
 
 print_banner
-confirm_cleanup
 
-clean_dir_contents "$HOME/Library/Developer/Xcode/DerivedData" "Xcode DerivedData"
-clean_dir_contents "$HOME/Library/Developer/Xcode/Archives" "Xcode Archives"
-clean_command pod "CocoaPods cache" pod cache clean --all
-clean_command npm "npm cache" npm cache clean --force
-clean_path "$HOME/.npm/_npx" "npx cache"
+if [ "$dry_run" -eq 1 ]; then
+  printf '%s\n' 'DRY RUN: commands will be shown, but nothing will be deleted or changed.'
+fi
 
-printf '%s\n' "Done."
+printf '%s\n' \
+  'Quit Xcode, Simulator, and package managers. Leave Docker running if you want its cache pruned.'
+if ! prompt_yes 'Run the routine cache cleanup now? [y/N] '; then
+  printf '%s\n' 'Cancelled.'
+  exit 0
+fi
+
+clean_standard_caches
+
+if prompt_yes 'Review optional one-time and state-removing cleanups? [y/N] '; then
+  review_optional_cleanups
+else
+  printf '%s\n' 'Skipping optional cleanups.'
+fi
+
+if [ "$warning_count" -gt 0 ]; then
+  printf 'Done with %s warning(s).\n' "$warning_count" >&2
+else
+  printf '%s\n' 'Done.'
+fi
